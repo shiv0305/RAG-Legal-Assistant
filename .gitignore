@@ -1,0 +1,65 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environment
+venv/
+env/
+.venv/
+ENV/
+venv.bak/
+
+# Chroma DB (large binary DB output)
+chroma_db/
+
+# Local environment files
+.env
+.env.* 
+.env.local
+.envrc
+
+# Notebook checkpoints
+.ipynb_checkpoints
+
+# macOS
+.DS_Store
+
+# Windows
+Thumbs.db
+ehthumbs.db
+desktop.ini
+
+# IDEs / Editors
+.vscode/
+.idea/
+*.sublime-workspace
+*.sublime-project
+
+# Logs and temporary files
+*.log
+tmp/
+temp/
+
+# Hugging Face cache / models (optional — keep if large)
+huggingface_hub/
+.cache/
+models/
+
+# Screenshots / artifacts (if you don't want to commit)
+#screenshots/
+
+# PyInstaller
+dist/
+build/
+*.spec
+
+# pipenv / poetry
+Pipfile.lock
+poetry.lock
+
+# OS generated files
+*.swp
+
+# Other
+*.sqlite3

@@ -1,0 +1,24 @@
+Found 3 test queries.
+
+Q: Who are the parties in the agreement?
+  retrieval time: 0.142s
+  top-1 files: ['sample.txt.txt'] -> HIT
+  top-3 files: ['sample.txt.txt'] -> HIT
+  top-5 files: ['sample.txt.txt'] -> HIT
+
+Q: What is the payment amount?
+  retrieval time: 0.021s
+  top-1 files: ['sample.txt.txt'] -> HIT
+  top-3 files: ['sample.txt.txt'] -> HIT
+  top-5 files: ['sample.txt.txt'] -> HIT
+
+Q: What is the termination notice period?
+  retrieval time: 0.010s
+  top-1 files: ['sample.txt.txt'] -> HIT
+  top-3 files: ['sample.txt.txt'] -> HIT
+  top-5 files: ['sample.txt.txt'] -> HIT
+
+===== SUMMARY =====
+Precision@1: 3/3 = 1.00
+Precision@3: 3/3 = 1.00
+Precision@5: 3/3 = 1.00

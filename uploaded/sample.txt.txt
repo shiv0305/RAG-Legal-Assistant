@@ -1,0 +1,7 @@
+AGREEMENT BETWEEN ALPHA AND BETA
+Section 1: Parties
+Alpha and Beta hereby enter into this contract.
+Section 3: Payment
+Beta shall pay Alpha INR 1,00,000 within 30 days of invoice.
+Section 5: Termination
+Either party may terminate with 30 days' notice.

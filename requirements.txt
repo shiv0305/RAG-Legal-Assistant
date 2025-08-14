@@ -1,0 +1,10 @@
+streamlit
+openai
+chromadb
+pdfplumber
+python-docx
+tqdm
+pandas
+python-multipart
+requests
+sentence-transformers
