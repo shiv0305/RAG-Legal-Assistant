@@ -53,11 +53,15 @@ def build_context_from_retrieval(results) -> str:
 def _format_citation(meta, chunk_id):
     return f"[{meta.get('filename','?')} | p.{meta.get('page','?')} | {meta.get('section','?')} | {chunk_id}]"
 
-def _extractive_answer_from_chunks(retrieved_results, max_chars=1200):
+# -------------------------
+# Improved extractive answer with intent-detection
+# -------------------------
+def _extractive_answer_from_chunks(retrieved_results, query: str = None, max_chars=1200):
     """
     Improved extractive answer:
-      - Tries structured extraction for 'Parties' sections and common legal phrasing.
-      - Falls back to the original simple first-sentence approach if nothing matched.
+      - Intent-detects common legal questions (payment amount, who pays, parties, termination).
+      - Uses targeted regex extraction from top retrieved chunks.
+      - Falls back to first-sentence extractive behavior otherwise.
     """
     docs = retrieved_results.get("documents", [[]])[0]
     metas = retrieved_results.get("metadatas", [[]])[0]
@@ -65,80 +69,159 @@ def _extractive_answer_from_chunks(retrieved_results, max_chars=1200):
 
     out_lines = []
 
-    # 1) Try targeted extraction for party names or clause text
-    party_text = None
-    party_meta = None
-    party_id = None
+    # Normalize query
+    q = (query or "").lower()
 
-    # patterns to try (ordered)
-    patterns = [
-        # Section N: Parties ... (capture everything until next "Section" or end)
-        re.compile(r"Section\s*\d+\s*[:\-]?\s*Parties\s*[:\-]?\s*(.+?)(?:Section\s*\d+|$)", re.IGNORECASE | re.DOTALL),
-        # "Parties" header without "Section", capture trailing sentence(s)
-        re.compile(r"Parties\s*[:\-]?\s*(.+?)(?:Section\s*\d+|$|\n\n)", re.IGNORECASE | re.DOTALL),
-        # "<Name> and <Name> hereby" or "<Name> and <Name> agree"
-        re.compile(r"([A-Z][A-Za-z0-9&\-,\. ]{1,80}?(?: and | & |, and |, )+[A-Z][A-Za-z0-9&\-,\. ]{1,80}?) (?:hereby|agree|enter|are|shall)", re.IGNORECASE),
-        # simple "X shall pay Y" (fallback patterns — not parties but may help)
-        re.compile(r"([A-Z][A-Za-z0-9&\-,\. ]{1,120}?) (?:shall pay|shall provide|shall deliver|agrees to)", re.IGNORECASE),
-    ]
-
-    for i, text in enumerate(docs):
-        if not text:
-            continue
-        for pat in patterns:
-            m = pat.search(text)
+    # Helper: search chunks for a regex and return (match_text, meta, id, full_sentence)
+    def search_chunks_for_regex(pattern):
+        for i, text in enumerate(docs):
+            if not text:
+                continue
+            m = pattern.search(text)
             if m:
-                party_text = m.group(1).strip()
-                party_meta = metas[i] if metas and len(metas) > i else {}
-                party_id = ids[i] if ids and len(ids) > i else f"chunk{i}"
-                break
-        if party_text:
-            break
+                # prefer capturing group 1 if present
+                match_txt = m.group(1).strip() if m.groups() else m.group(0).strip()
+                # find enclosing sentence for context
+                sentences = re.split(r'(?<=[\.\?\!])\s+', text.strip())
+                sent = None
+                for s in sentences:
+                    if match_txt in s:
+                        sent = s.strip()
+                        break
+                if not sent:
+                    sent = text.strip().split(".")[0].strip()
+                meta = metas[i] if metas and len(metas) > i else {}
+                cid = ids[i] if ids and len(ids) > i else f"chunk{i}"
+                return match_txt, meta, cid, sent
+        return None, None, None, None
 
-    # 2) Build concise answer
-    if party_text:
-        # Clean up whitespace and trailing artifacts
-        party_text = re.sub(r"\s+", " ", party_text).strip()
-        # If the result looks like a short header (e.g., just "Parties"), try to get additional context/sentence
-        if len(party_text.split()) <= 3 and docs:
-            # try next sentence in the chunk we found or the first retrieved doc
-            source_doc = docs[0]
-            sentences = re.split(r'(?<=[\.\?\!])\s+', source_doc)
-            if len(sentences) > 1 and len(sentences[0].strip()) > 2:
-                concise = sentences[0].strip()
-            else:
-                concise = party_text
-        else:
-            concise = party_text
-    else:
-        # fallback: use first sentence of first retrieved doc
-        concise = ""
-        if docs:
-            first = docs[0].strip()
-            sentences = re.split(r'(?<=[\.\?\!])\s+', first)
-            if sentences and sentences[0].strip():
-                concise = sentences[0].strip()
-            else:
-                concise = first[:200].strip()
-        if not concise:
-            concise = "No concise answer could be extracted from the retrieved excerpts."
+    # 1) Payment amount intent
+    if any(tok in q for tok in ["payment amount", "amount", "how much", "payment", "amount payable"]):
+        # currency patterns: INR, Rs., ₹ or numeric plus currency words
+        pat_currency = re.compile(r"(?:INR|Rs\.?|₹)\s*([0-9][0-9,]*(?:\.\d+)?)", re.IGNORECASE)
+        match_txt, meta, cid, sent = search_chunks_for_regex(pat_currency)
+        if match_txt:
+            concise = f"{meta.get('filename','unknown')} payment amount: {('INR ' + match_txt) if not match_txt.lower().startswith(('inr','rs','₹')) else match_txt}"
+            out_lines.append("**Extractive concise answer:**")
+            out_lines.append(concise + "\n")
+            out_lines.append("**Supporting citations / excerpts:**")
+            out_lines.append(f"1. Citation: {_format_citation(meta, cid)}")
+            out_lines.append(f"> {sent}\n")
+            return "\n".join(out_lines)
 
-    # 3) Compose output
-    out_lines.append("**Extractive concise answer:**")
-    out_lines.append(concise + "\n")
+        # fallback: look for patterns like "Beta shall pay Alpha INR 1,00,000..."
+        pat_pay_sentence = re.compile(r"([A-Z][\w\-\s\,\.&]{0,120}?)\s+shall\s+pay\s+([A-Z][\w\-\s\,\.&]{0,120}?).*?(?:INR|Rs\.?|₹)?\s*([0-9][0-9,]*(?:\.\d+)?)", re.IGNORECASE)
+        match_txt, meta, cid, sent = search_chunks_for_regex(pat_pay_sentence)
+        if match_txt:
+            # the group logic in search function returns group(1) — to be safe, re-run on match chunk
+            m = pat_pay_sentence.search(docs[0]) if docs else None
+            # Instead, just use the sentence found
+            concise = sent
+            out_lines.append("**Extractive concise answer:**")
+            out_lines.append(concise + "\n")
+            out_lines.append("**Supporting citations / excerpts:**")
+            out_lines.append(f"1. Citation: {_format_citation(meta, cid)}")
+            out_lines.append(f"> {sent}\n")
+            return "\n".join(out_lines)
 
-    out_lines.append("**Supporting citations / excerpts:**")
-    for i, text in enumerate(docs):
-        meta = metas[i] if metas and len(metas) > i else {}
-        cid = ids[i] if ids and len(ids) > i else f"chunk{i}"
-        excerpt = text.strip()
-        if len(excerpt) > 800:
-            excerpt = excerpt[:800].rsplit(" ",1)[0] + " ... (truncated)"
-        out_lines.append(f"{i+1}. Citation: {_format_citation(meta, cid)}")
-        out_lines.append(f"> {excerpt}\n")
+    # 2) Who pays whom / payer payee intent
+    if any(tok in q for tok in ["who pays", "who will pay", "payer", "pay whom", "who pays whom"]):
+        pat = re.compile(r"([A-Z][\w\-\s\,\.&]{0,120}?)\s+shall\s+pay\s+([A-Z][\w\-\s\,\.&]{0,120}?)", re.IGNORECASE)
+        match_txt, meta, cid, sent = search_chunks_for_regex(pat)
+        if match_txt:
+            out_lines.append("**Extractive concise answer:**")
+            out_lines.append(sent + "\n")
+            out_lines.append("**Supporting citations / excerpts:**")
+            out_lines.append(f"1. Citation: {_format_citation(meta, cid)}")
+            out_lines.append(f"> {sent}\n")
+            return "\n".join(out_lines)
 
-    # out_lines.append("**Note:** This is an extractive answer (no external LLM). Configure an OpenAI key or set USE_LOCAL_GEN to true for a generative answer.")
-    return "\n".join(out_lines)
+    # 3) Termination / notice period intent
+    if any(tok in q for tok in ["termination", "notice period", "terminate", "notice"]):
+        # find e.g., "30 days' notice" or "30 days notice" or "30-day notice"
+        pat_days = re.compile(r"(\d{1,3})\s*(?:-day|days|'s)?\s*notice", re.IGNORECASE)
+        match_txt, meta, cid, sent = search_chunks_for_regex(pat_days)
+        if match_txt:
+            concise = f"Termination notice period: {match_txt} days (as stated in excerpt)."
+            out_lines.append("**Extractive concise answer:**")
+            out_lines.append(concise + "\n")
+            out_lines.append("**Supporting citations / excerpts:**")
+            out_lines.append(f"1. Citation: {_format_citation(meta, cid)}")
+            out_lines.append(f"> {sent}\n")
+            return "\n".join(out_lines)
+
+        # fallback: sentence containing 'terminate'
+        pat_term = re.compile(r".{0,200}\bterminate\b.{0,200}", re.IGNORECASE)
+        match_txt, meta, cid, sent = search_chunks_for_regex(pat_term)
+        if match_txt:
+            out_lines.append("**Extractive concise answer:**")
+            out_lines.append(sent + "\n")
+            out_lines.append("**Supporting citations / excerpts:**")
+            out_lines.append(f"1. Citation: {_format_citation(meta, cid)}")
+            out_lines.append(f"> {sent}\n")
+            return "\n".join(out_lines)
+
+    # 4) Parties intent
+    if any(tok in q for tok in ["who are the parties", "parties", "who are the parties in", "who are the parties in the agreement", "party"]):
+        # Section style or inline "Alpha and Beta hereby enter..."
+        pat_section_parties = re.compile(r"Section\s*\d+\s*[:\-]?\s*Parties\s*[:\-]?\s*(.+?)(?:Section\s*\d+|$)", re.IGNORECASE | re.DOTALL)
+        pat_inline = re.compile(r"([A-Z][A-Za-z0-9&\-\., ]{1,80}?)\s+(?:and|&|, and)\s+([A-Z][A-Za-z0-9&\-\., ]{1,80}?)\s+(?:hereby|enter|agree|are)", re.IGNORECASE)
+        # try section pattern first
+        match_txt, meta, cid, sent = search_chunks_for_regex(pat_section_parties)
+        if match_txt:
+            # clean header artifacts
+            cleaned = re.sub(r"\s+", " ", match_txt).strip()
+            concise = cleaned
+            out_lines.append("**Extractive concise answer:**")
+            out_lines.append(concise + "\n")
+            out_lines.append("**Supporting citations / excerpts:**")
+            out_lines.append(f"1. Citation: {_format_citation(meta, cid)}")
+            out_lines.append(f"> {sent}\n")
+            return "\n".join(out_lines)
+
+        match_txt, meta, cid, sent = search_chunks_for_regex(pat_inline)
+        if match_txt:
+            concise = match_txt
+            out_lines.append("**Extractive concise answer:**")
+            out_lines.append(concise + "\n")
+            out_lines.append("**Supporting citations / excerpts:**")
+            out_lines.append(f"1. Citation: {_format_citation(meta, cid)}")
+            out_lines.append(f"> {sent}\n")
+            return "\n".join(out_lines)
+
+    # 5) Generic: try to answer small factual queries by extracting the most relevant short sentence
+    if docs:
+        # pick the top doc and try to extract a short sentence likely answering
+        top_doc = docs[0]
+        sentences = re.split(r'(?<=[\.\?\!])\s+', top_doc.strip())
+        # select the first sentence that contains a token from the query (if query provided)
+        chosen = None
+        if q:
+            q_tokens = [t for t in re.split(r'\W+', q) if t and len(t) > 2]
+            for s in sentences:
+                s_low = s.lower()
+                if any(tok in s_low for tok in q_tokens):
+                    chosen = s.strip()
+                    break
+        if not chosen:
+            chosen = sentences[0].strip() if sentences else top_doc[:200].strip()
+
+        out_lines.append("**Extractive concise answer:**")
+        out_lines.append(chosen + "\n")
+
+        out_lines.append("**Supporting citations / excerpts:**")
+        for i, text in enumerate(docs):
+            meta = metas[i] if metas and len(metas) > i else {}
+            cid = ids[i] if ids and len(ids) > i else f"chunk{i}"
+            excerpt = text.strip()
+            if len(excerpt) > 800:
+                excerpt = excerpt[:800].rsplit(" ",1)[0] + " ... (truncated)"
+            out_lines.append(f"{i+1}. Citation: {_format_citation(meta, cid)}")
+            out_lines.append(f"> {excerpt}\n")
+        return "\n".join(out_lines)
+
+    # If nothing matched and no docs:
+    return "No relevant excerpts found in the indexed documents."
 
 # -------------------------
 # Synthesis: OpenAI / local / extractive
@@ -148,9 +231,8 @@ def synthesize_answer(query: str, retrieved_results) -> str:
     Generate a synthesized answer. Priority:
     1) Use OpenAI if configured
     2) Else use local generator if enabled
-    3) Else return extractive fallback
+    3) Else return extractive fallback (now uses query-aware extraction)
     """
-
     # 1) OpenAI path (if available)
     if _use_openai and openai_client is not None:
         try:
@@ -175,7 +257,7 @@ Provide:
             resp = openai_client.chat.completions.create(model=OPENAI_MODEL, messages=messages, max_tokens=700)
             return resp.choices[0].message.content
         except Exception as e:
-            return f"OpenAI generation failed ({e}). Falling back to extractive output.\n\n" + _extractive_answer_from_chunks(retrieved_results)
+            return f"OpenAI generation failed ({e}). Falling back to extractive output.\n\n" + _extractive_answer_from_chunks(retrieved_results, query)
 
     # 2) Local generator path (if configured)
     if _USE_LOCAL_GEN and _local_gen is not None:
@@ -183,12 +265,12 @@ Provide:
             context = build_context_from_retrieval(retrieved_results)
             prompt = f"CONTEXT:\n{context}\nQUESTION: {query}\nAnswer concisely and cite sources in square brackets (e.g. [file | p.1 | section | id])."
             gen = _local_gen(prompt, max_length=200, do_sample=False, num_return_sequences=1)
-            txt = gen[0]["generated_text"]
+            txt = gen[0].get("generated_text", "")
             if prompt in txt:
                 txt = txt.split(prompt, 1)[-1].strip()
             return txt
         except Exception as e:
-            return f"Local generator failed ({e}). Falling back to extractive output.\n\n" + _extractive_answer_from_chunks(retrieved_results)
+            return f"Local generator failed ({e}). Falling back to extractive output.\n\n" + _extractive_answer_from_chunks(retrieved_results, query)
 
-    # 3) Extractive fallback
-    return _extractive_answer_from_chunks(retrieved_results)
+    # 3) Extractive fallback (query-aware)
+    return _extractive_answer_from_chunks(retrieved_results, query)
