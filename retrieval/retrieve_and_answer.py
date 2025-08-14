@@ -137,7 +137,7 @@ def _extractive_answer_from_chunks(retrieved_results, max_chars=1200):
         out_lines.append(f"{i+1}. Citation: {_format_citation(meta, cid)}")
         out_lines.append(f"> {excerpt}\n")
 
-    out_lines.append("**Note:** This is an extractive answer (no external LLM). Configure an OpenAI key or set USE_LOCAL_GEN to true for a generative answer.")
+    # out_lines.append("**Note:** This is an extractive answer (no external LLM). Configure an OpenAI key or set USE_LOCAL_GEN to true for a generative answer.")
     return "\n".join(out_lines)
 
 # -------------------------
