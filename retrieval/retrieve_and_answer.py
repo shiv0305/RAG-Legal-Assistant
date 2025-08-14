@@ -1,6 +1,7 @@
 # retrieval/retrieve_and_answer.py
 import os
 import time
+import re
 from typing import List
 
 # --- OpenAI v1 client (optional) ---
@@ -22,7 +23,6 @@ if _USE_LOCAL_GEN:
     try:
         from transformers import pipeline
         local_model = os.environ.get("LOCAL_GEN_MODEL", "distilgpt2")
-        # CPU by default; set device if you have GPU (not needed on Streamlit Cloud typical)
         _local_gen = pipeline("text-generation", model=local_model)
     except Exception:
         _local_gen = None
@@ -55,34 +55,78 @@ def _format_citation(meta, chunk_id):
 
 def _extractive_answer_from_chunks(retrieved_results, max_chars=1200):
     """
-    Build a concise extractive answer using top retrieved chunks.
+    Improved extractive answer:
+      - Tries structured extraction for 'Parties' sections and common legal phrasing.
+      - Falls back to the original simple first-sentence approach if nothing matched.
     """
     docs = retrieved_results.get("documents", [[]])[0]
     metas = retrieved_results.get("metadatas", [[]])[0]
     ids = retrieved_results.get("ids", [[]])[0]
 
     out_lines = []
-    # Short concise answer: try to form from first relevant chunk
-    concise = ""
-    if docs:
-        # try to pick a short sentence that answers the query (best-effort)
-        first = docs[0].strip()
-        # if there's 'Section 1: Parties' we can extract after that
-        if "Section 1" in first or "Parties" in first:
-            # heuristics: find line containing "Parties" or the first sentence
-            for line in first.splitlines():
-                if "Parties" in line or "party" in line.lower():
-                    concise = line.strip()
-                    break
-        if not concise:
-            concise = first.split(".")[0].strip()
-    if not concise:
-        concise = "No concise answer could be extracted from the retrieved excerpts."
 
+    # 1) Try targeted extraction for party names or clause text
+    party_text = None
+    party_meta = None
+    party_id = None
+
+    # patterns to try (ordered)
+    patterns = [
+        # Section N: Parties ... (capture everything until next "Section" or end)
+        re.compile(r"Section\s*\d+\s*[:\-]?\s*Parties\s*[:\-]?\s*(.+?)(?:Section\s*\d+|$)", re.IGNORECASE | re.DOTALL),
+        # "Parties" header without "Section", capture trailing sentence(s)
+        re.compile(r"Parties\s*[:\-]?\s*(.+?)(?:Section\s*\d+|$|\n\n)", re.IGNORECASE | re.DOTALL),
+        # "<Name> and <Name> hereby" or "<Name> and <Name> agree"
+        re.compile(r"([A-Z][A-Za-z0-9&\-,\. ]{1,80}?(?: and | & |, and |, )+[A-Z][A-Za-z0-9&\-,\. ]{1,80}?) (?:hereby|agree|enter|are|shall)", re.IGNORECASE),
+        # simple "X shall pay Y" (fallback patterns — not parties but may help)
+        re.compile(r"([A-Z][A-Za-z0-9&\-,\. ]{1,120}?) (?:shall pay|shall provide|shall deliver|agrees to)", re.IGNORECASE),
+    ]
+
+    for i, text in enumerate(docs):
+        if not text:
+            continue
+        for pat in patterns:
+            m = pat.search(text)
+            if m:
+                party_text = m.group(1).strip()
+                party_meta = metas[i] if metas and len(metas) > i else {}
+                party_id = ids[i] if ids and len(ids) > i else f"chunk{i}"
+                break
+        if party_text:
+            break
+
+    # 2) Build concise answer
+    if party_text:
+        # Clean up whitespace and trailing artifacts
+        party_text = re.sub(r"\s+", " ", party_text).strip()
+        # If the result looks like a short header (e.g., just "Parties"), try to get additional context/sentence
+        if len(party_text.split()) <= 3 and docs:
+            # try next sentence in the chunk we found or the first retrieved doc
+            source_doc = docs[0]
+            sentences = re.split(r'(?<=[\.\?\!])\s+', source_doc)
+            if len(sentences) > 1 and len(sentences[0].strip()) > 2:
+                concise = sentences[0].strip()
+            else:
+                concise = party_text
+        else:
+            concise = party_text
+    else:
+        # fallback: use first sentence of first retrieved doc
+        concise = ""
+        if docs:
+            first = docs[0].strip()
+            sentences = re.split(r'(?<=[\.\?\!])\s+', first)
+            if sentences and sentences[0].strip():
+                concise = sentences[0].strip()
+            else:
+                concise = first[:200].strip()
+        if not concise:
+            concise = "No concise answer could be extracted from the retrieved excerpts."
+
+    # 3) Compose output
     out_lines.append("**Extractive concise answer:**")
     out_lines.append(concise + "\n")
 
-    # Supporting citations (numbered)
     out_lines.append("**Supporting citations / excerpts:**")
     for i, text in enumerate(docs):
         meta = metas[i] if metas and len(metas) > i else {}
@@ -127,24 +171,19 @@ Provide:
 2) A numbered list of supporting citations with exact excerpt(s).
 3) If conflicts exist, a 'Conflicts' section.
 """
-            # call OpenAI Chat Completions (v1 client)
             messages = [{"role": "user", "content": prompt}]
             resp = openai_client.chat.completions.create(model=OPENAI_MODEL, messages=messages, max_tokens=700)
             return resp.choices[0].message.content
         except Exception as e:
-            # if OpenAI fails, fallback to extractive
             return f"OpenAI generation failed ({e}). Falling back to extractive output.\n\n" + _extractive_answer_from_chunks(retrieved_results)
 
     # 2) Local generator path (if configured)
     if _USE_LOCAL_GEN and _local_gen is not None:
         try:
             context = build_context_from_retrieval(retrieved_results)
-            # Simple user friendly prompt for local generator
             prompt = f"CONTEXT:\n{context}\nQUESTION: {query}\nAnswer concisely and cite sources in square brackets (e.g. [file | p.1 | section | id])."
-            # generate short text
             gen = _local_gen(prompt, max_length=200, do_sample=False, num_return_sequences=1)
             txt = gen[0]["generated_text"]
-            # cut prompt echo if generator returns it
             if prompt in txt:
                 txt = txt.split(prompt, 1)[-1].strip()
             return txt
