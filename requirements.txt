@@ -1,6 +1,6 @@
 streamlit
 openai
-chromadb
+chromadb==0.3.21
 pdfplumber
 python-docx
 tqdm
