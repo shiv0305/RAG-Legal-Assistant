@@ -1,10 +1,19 @@
 # retrieval/retrieve_and_answer.py
+"""
+Retrieval + answer synthesis module with automatic (semantic) intent detection.
+No external intents.json required — intents are built-in and matched to user queries
+using SentenceTransformers semantic similarity.
+
+Functions:
+- synthesize_answer(query, retrieved_results) -> str
+"""
+
 import os
 import re
-import json
-from typing import List, Optional
+import time
+from typing import Optional
 
-# --- Optional OpenAI v1 client (if you want LLM synthesis) ---
+# Optional OpenAI v1 client (if you want LLM synthesis)
 openai_client = None
 _use_openai = False
 try:
@@ -16,7 +25,7 @@ try:
 except Exception:
     _use_openai = False
 
-# --- Optional local generator (transformers) ---
+# Optional local generator (transformers)
 _USE_LOCAL_GEN = os.environ.get("USE_LOCAL_GEN", "false").lower() == "true"
 _local_gen = None
 if _USE_LOCAL_GEN:
@@ -30,73 +39,109 @@ if _USE_LOCAL_GEN:
 
 OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-3.5-turbo")
 
+# --- Semantic intent detection using sentence-transformers ---
+try:
+    from sentence_transformers import SentenceTransformer, util
+    _INTENT_EMBEDDER = SentenceTransformer(os.environ.get("SBERT_MODEL", "all-MiniLM-L6-v2"))
+except Exception:
+    _INTENT_EMBEDDER = None
 
-# ----------------------
-# Intent config loader
-# ----------------------
-INTENTS_PATH = os.path.join("intents", "intents.json")
-
-DEFAULT_INTENTS = [
+# ------------------------------
+# Built-in intents (editable here if desired)
+# ------------------------------
+# Each intent has: name, description (used for semantic match), extractors (regex list)
+INTENTS = [
+    {
+        "name": "parties",
+        "description": "Find the parties to the agreement (who are the parties).",
+        "extractors": [
+            r"Section\s*\d+\s*[:\-]?\s*Parties\s*[:\-]?\s*(.+?)(?:Section\s*\d+|$)",
+            r"([A-Z][A-Za-z0-9&\-\., ]{1,80}?)\s+(?:and|&|, and|,)\s+([A-Z][A-Za-z0-9&\-\., ]{1,80}?)\s+(?:hereby|enter|agree|are)"
+        ],
+    },
     {
         "name": "which_section",
-        "match_keywords": ["which section", "what section", "section contains", "which clause"],
-        # attempt to find section headers containing the target word (see code logic)
+        "description": "Which section contains a given clause (payment, termination, parties, confidentiality)?",
         "extractors": [
-            r"(Section\s*\d+\s*[:\-]\s*[^.\n]+)"   # generic section header
+            r"(Section\s*\d+\s*[:\-]\s*[^.\n]+)"
         ],
-        "notes": "Return Section N: Header if header contains target word from query"
     },
     {
         "name": "payment_amount",
-        "match_keywords": ["payment amount", "amount", "how much", "payment", "amount payable"],
+        "description": "Extract the payment amount (currency like INR, Rs., ₹ and numeric value).",
         "extractors": [
             r"(?:INR|Rs\.?|₹)\s*([0-9][0-9,]*(?:\.\d+)?)",
             r"shall\s+pay\s+.*?(?:INR|Rs\.?|₹)?\s*([0-9][0-9,]*(?:\.\d+)?)"
         ],
-        "notes": "Extract numeric currency amounts"
     },
     {
         "name": "who_pays",
-        "match_keywords": ["who pays", "who will pay", "who shall pay", "payer"],
+        "description": "Who is required to make payment (payer / payee)?",
         "extractors": [
             r"([A-Z][\w\-\s\,\.&]{0,120}?)\s+shall\s+pay\s+([A-Z][\w\-\s\,\.&]{0,120}?)"
-        ]
+        ],
     },
     {
         "name": "termination_notice",
-        "match_keywords": ["termination", "notice period", "terminate", "notice", "termination notice"],
+        "description": "Find termination or notice period (e.g., 30 days notice).",
         "extractors": [
             r"(\d{1,3})\s*(?:-day|days|'s)?\s*notice",
             r".{0,200}\bterminate\b.{0,200}"
-        ]
+        ],
     },
     {
-        "name": "parties",
-        "match_keywords": ["who are the parties", "parties", "who are the parties in the agreement", "party"],
+        "name": "section_content",
+        "description": "Return the content of a specific section (e.g., Section 1, Section 3).",
         "extractors": [
-            r"Section\s*\d+\s*[:\-]?\s*Parties\s*[:\-]?\s*(.+?)(?:Section\s*\d+|$)",
-            r"([A-Z][A-Za-z0-9&\-\., ]{1,80}?)\s+(?:and|&|, and|,)\s+([A-Z][A-Za-z0-9&\-\., ]{1,80}?)\s+(?:hereby|enter|agree|are)"
-        ]
+            r"(Section\s*\d+\s*[:\-]?\s*[^.\n]+(?:\n|.){0,400})"
+        ],
     }
 ]
 
-def load_intents():
-    if os.path.exists(INTENTS_PATH):
-        try:
-            with open(INTENTS_PATH, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            if isinstance(data, list) and data:
-                return data
-        except Exception:
-            pass
-    # fallback
-    return DEFAULT_INTENTS
+# Precompute intent embeddings if embedder is available
+_INTENT_EMBS = None
+if _INTENT_EMBEDDER is not None:
+    try:
+        _INTENT_EMBS = _INTENT_EMBEDDER.encode(
+            [intent["description"] for intent in INTENTS],
+            convert_to_tensor=True,
+            normalize_embeddings=True
+        )
+    except Exception:
+        _INTENT_EMBS = None
 
-INTENTS = load_intents()
+def _choose_intent_semantic(query: str, threshold: float = 0.45):
+    """
+    Return the best intent dict (or None) based on semantic similarity between the query
+    and intent descriptions. Threshold is adjustable. If no embedder available, fallback
+    to keyword detection using simple tokens.
+    """
+    q = (query or "").strip()
+    if not q:
+        return None
 
+    # 1) semantic match if embedding model available
+    if _INTENT_EMBS is not None and _INTENT_EMBEDDER is not None:
+        q_emb = _INTENT_EMBEDDER.encode(q, convert_to_tensor=True, normalize_embeddings=True)
+        sims = util.pytorch_cos_sim(q_emb, _INTENT_EMBS)[0]  # tensor of similarities
+        best_idx = int(sims.argmax().cpu().numpy())
+        best_score = float(sims[best_idx].cpu().numpy())
+        if best_score >= threshold:
+            return INTENTS[best_idx]
+        # if below threshold, still return best match (useful for short queries)
+        return INTENTS[best_idx] if best_score >= 0.30 else None
+
+    # 2) fallback simple keyword matching without external file
+    q_low = q.lower()
+    for intent in INTENTS:
+        # check if any important token from description appears in query
+        for tok in intent["description"].split():
+            if tok.lower().strip(",.") in q_low and len(tok) > 3:
+                return intent
+    return None
 
 # -------------------------
-# Helpers
+# Utility helpers (same pattern as previous file)
 # -------------------------
 def build_context_from_retrieval(results) -> str:
     blocks = []
@@ -139,9 +184,7 @@ def _search_chunks(docs, metas, ids, pattern: re.Pattern):
             return m, meta, cid, sentence, i
     return None, None, None, None, None
 
-# -------------------------
-# Conflict detection (simple numeric claims)
-# -------------------------
+# Simple conflict detection (amounts and notice periods)
 def _detect_conflicts(retrieved_results):
     docs = retrieved_results.get("documents", [[]])[0]
     metas = retrieved_results.get("metadatas", [[]])[0]
@@ -173,9 +216,7 @@ def _detect_conflicts(retrieved_results):
             parts.append(f"- {k} days — {', '.join(v)}")
     return ("\n".join(parts)) if parts else ""
 
-# -------------------------
-# Core extraction using intents
-# -------------------------
+# Core extractive engine (uses matched intent)
 def _extractive_answer_from_chunks(retrieved_results, query: Optional[str] = None):
     docs = retrieved_results.get("documents", [[]])[0]
     metas = retrieved_results.get("metadatas", [[]])[0]
@@ -183,82 +224,40 @@ def _extractive_answer_from_chunks(retrieved_results, query: Optional[str] = Non
     if not docs:
         return "No indexed documents available."
 
-    q = (query or "").lower()
-    # find matching intent by keywords first (configurable)
-    matched_intent = None
-    for intent in INTENTS:
-        kws = intent.get("match_keywords", [])
-        if any(kw in q for kw in kws):
-            matched_intent = intent
-            break
-    # if none matched, try fuzzy match by scanning for common words from intents
-    if matched_intent is None:
-        for intent in INTENTS:
-            for kw in intent.get("match_keywords", []):
-                if kw.split()[0] in q:  # partial token match
-                    matched_intent = intent
-                    break
-            if matched_intent:
-                break
+    # automatic intent choice
+    intent = _choose_intent_semantic(query or "")
+    # if no intent chosen, do simple fallback: attempt a few known patterns
+    if intent is None:
+        # naive keyword-based fallback
+        q = (query or "").lower()
+        if any(tok in q for tok in ["payment", "amount", "how much", "how much is"]):
+            intent = next((it for it in INTENTS if it["name"] == "payment_amount"), None)
+        elif any(tok in q for tok in ["party", "parties", "who are the parties"]):
+            intent = next((it for it in INTENTS if it["name"] == "parties"), None)
 
-    # extraction workflow
-    if matched_intent:
-        extractors = matched_intent.get("extractors", [])
-        # when handling "which_section" specially, we also consider target words from query
-        if matched_intent.get("name") == "which_section":
-            # attempt to find section header that includes the clause term from query
-            target_words = ["payment", "terminate", "termination", "parties", "notice"]
-            found_target = None
-            for t in target_words:
-                if t in q:
-                    found_target = t
-                    break
-            # search for Section header patterns, prefer those that mention target
-            header_pat = re.compile(r"(Section\s*\d+\s*[:\-]\s*[^.\n]+)", re.IGNORECASE)
-            m, meta, cid, sent, idx = _search_chunks(docs, metas, ids, header_pat)
-            if m:
-                header = m.group(1)
-                if (found_target and found_target in header.lower()) or found_target is None:
-                    sec_num = re.search(r"(Section\s*\d+)", header, re.IGNORECASE)
-                    sec_label = sec_num.group(1) if sec_num else header
-                    concise = f"{sec_label}: {header.split(':',1)[-1].strip()}" if ":" in header else header
-                    out = f"**Extractive concise answer:**\n{concise}\n\n**Supporting citations / excerpts:**\n1. Citation: {_format_citation(meta, cid)}\n> {sent}\n"
-                    return out
-            return "No explicit section header found in the retrieved excerpts that matches the requested clause."
-        # for other intents, run configured extractor regexes in order
-        for ex in extractors:
-            pat = re.compile(ex, re.IGNORECASE)
+    # If we have an intent, run its extractors
+    if intent is not None:
+        for ex in intent.get("extractors", []):
+            pat = re.compile(ex, re.IGNORECASE | re.DOTALL)
             m, meta, cid, sent, idx = _search_chunks(docs, metas, ids, pat)
             if m:
-                # build good concise answer based on intent name
-                name = matched_intent.get("name")
+                name = intent.get("name")
+                # Payment amount
                 if name == "payment_amount":
-                    # group 1 expected numeric; fallback to full sentence
-                    val = None
                     try:
                         val = m.group(1)
+                        concise = f"Payment amount: INR {val}"
                     except Exception:
-                        val = None
-                    concise = f"Payment amount: INR {val}" if val else sent
+                        concise = sent
                     out = f"**Extractive concise answer:**\n{concise}\n\n**Supporting citations / excerpts:**\n1. Citation: {_format_citation(meta, cid)}\n> {sent}\n"
                     return out
-                elif name == "who_pays":
-                    # return the enclosing sentence
+                # Who pays
+                if name == "who_pays":
                     out = f"**Extractive concise answer:**\n{sent}\n\n**Supporting citations / excerpts:**\n1. Citation: {_format_citation(meta, cid)}\n> {sent}\n"
                     return out
-                elif name == "termination_notice":
-                    days = None
-                    try:
-                        days = m.group(1)
-                    except Exception:
-                        days = None
-                    concise = f"Termination notice period: {days} days." if days else sent
-                    out = f"**Extractive concise answer:**\n{concise}\n\n**Supporting citations / excerpts:**\n1. Citation: {_format_citation(meta, cid)}\n> {sent}\n"
-                    return out
-                elif name == "parties":
-                    # for parties extractor might capture the party names
+                # Parties
+                if name == "parties":
                     if m.groups():
-                        # join groups if two groups represent parties
                         if len(m.groups()) >= 2:
                             p1 = m.group(1).strip()
                             p2 = m.group(2).strip()
@@ -269,15 +268,32 @@ def _extractive_answer_from_chunks(retrieved_results, query: Optional[str] = Non
                         concise = sent.split(".")[0].strip()
                     out = f"**Extractive concise answer:**\n{concise}\n\n**Supporting citations / excerpts:**\n1. Citation: {_format_citation(meta, cid)}\n> {sent}\n"
                     return out
-                else:
-                    # generic return
-                    out = f"**Extractive concise answer:**\n{sent.split('.')[0].strip()}\n\n**Supporting citations / excerpts:**\n1. Citation: {_format_citation(meta, cid)}\n> {sent}\n"
+                # Termination / notice
+                if name == "termination_notice":
+                    try:
+                        days = m.group(1)
+                        concise = f"Termination notice period: {days} days."
+                    except Exception:
+                        concise = sent
+                    out = f"**Extractive concise answer:**\n{concise}\n\n**Supporting citations / excerpts:**\n1. Citation: {_format_citation(meta, cid)}\n> {sent}\n"
                     return out
+                # Section header / content
+                if name in ("which_section", "section_content"):
+                    header = m.group(1).strip() if m.groups() else m.group(0).strip()
+                    sec_num = re.search(r"(Section\s*\d+)", header, re.IGNORECASE)
+                    sec_label = sec_num.group(1) if sec_num else header
+                    concise = f"{sec_label}: {header.split(':',1)[-1].strip()}" if ":" in header else header
+                    out = f"**Extractive concise answer:**\n{concise}\n\n**Supporting citations / excerpts:**\n1. Citation: {_format_citation(meta, cid)}\n> {header}\n"
+                    return out
+                # generic fallback for intent
+                out = f"**Extractive concise answer:**\n{sent.split('.')[0].strip()}\n\n**Supporting citations / excerpts:**\n1. Citation: {_format_citation(meta, cid)}\n> {sent}\n"
+                return out
 
-    # Generic fallback: return top sentence matching query tokens, else first sentence
+    # Generic fallback: return top sentence that matches query tokens or first sentence
     top_doc = docs[0]
     sentences = re.split(r'(?<=[\.\?\!])\s+', top_doc.strip())
     chosen = None
+    q = (query or "").lower()
     if q:
         q_tokens = [t for t in re.split(r'\W+', q) if t and len(t) > 2]
         for s in sentences:
@@ -299,18 +315,14 @@ def _extractive_answer_from_chunks(retrieved_results, query: Optional[str] = Non
         out_lines.append(f"> {excerpt}\n")
     return "\n".join(out_lines)
 
-# -------------------------
-# Synthesis wrapper
-# -------------------------
+# Synthesis: OpenAI / local / extractive + conflict append
 def synthesize_answer(query: str, retrieved_results) -> str:
     """
-    1. If OpenAI configured => send context + prompt (LLM synth).
-    2. Else if local gen enabled => generate locally.
-    3. Else use extractive engine above.
-    After main answer, append conflict section (if any).
+    1) If OpenAI available -> use it
+    2) Else if local generator enabled -> use it
+    3) Else use extractive fallback
+    Append detected conflicts if any.
     """
-    answer = None
-    # OpenAI path
     if _use_openai and openai_client is not None:
         try:
             context = build_context_from_retrieval(retrieved_results)
@@ -349,8 +361,7 @@ Provide:
     else:
         answer = _extractive_answer_from_chunks(retrieved_results, query)
 
-    # detect conflicts and append
-    conflicts = _detect_conflicts(retrieved_results)
-    if conflicts:
-        answer = answer.rstrip() + "\n\nConflicts:\n" + conflicts
+    conflicts_txt = _detect_conflicts(retrieved_results)
+    if conflicts_txt:
+        answer = answer.rstrip() + "\n\nConflicts:\n" + conflicts_txt
     return answer
